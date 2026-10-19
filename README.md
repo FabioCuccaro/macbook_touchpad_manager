@@ -14,7 +14,7 @@ it works with any touchpad.
 | **Pointer** | Pointer speed (−100% … +100%), acceleration profile (adaptive / flat) |
 | **Clicking** | Tap to click, two-finger right click vs. click by area, disable while typing |
 | **Gestures** | Workspace swipe on/off, 3 or 4 fingers, natural or reversed direction |
-| **Per-app scrolling** | A scroll multiplier per window class (handy for terminals) |
+| **Per-app scroll speed** | Its own scroll speed (0.1–3×) for any app, picked from the windows you have open or typed by window class. Shows, and lets you override, the rules Omarchy ships for terminals |
 
 Changes are applied immediately and persisted, so they survive a Hyprland reload and a reboot.
 
@@ -27,7 +27,7 @@ Changes are applied immediately and persisted, so they survive a Hyprland reload
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/FabioCuccaro/macbook_touchpad_manager.git --enable
+omarchy plugin add https://github.com/FabioCuccaro/omarchy_touchpad_manager.git --enable
 ```
 
 `--enable` puts the widget in the bar. Without it, add the widget later with
@@ -56,9 +56,13 @@ Panel.qml  ──►  bin/touchpad-ctl  ──►  ~/.config/hypr/touchpad.json 
 
 - On the first run the settings are **seeded from the values Hyprland is using
   right now**, so enabling the plugin doesn't change how your touchpad behaves.
-- Most options are pushed live with `hyprctl eval`. Gestures and per-app rules
-  can only be declared in the config file, so changing them triggers a
-  `hyprctl reload`.
+- Most options are pushed live with `hyprctl eval`, and so are per-app speed
+  changes. Gestures and removing a per-app rule can only take effect through
+  the config file, so they trigger a `hyprctl reload`.
+- A per-app speed **replaces** the global scroll speed for that app (it is not a
+  multiplier). When several rules match a window the last one wins. The plugin's
+  rules load after Omarchy's defaults, so they override Omarchy's terminal rules
+  (`(Alacritty|kitty|foot)` at 1.5×, `com.mitchellh.ghostty` at 0.2×).
 - `touchpad.lua` is loaded with `pcall`, so a missing file never breaks your
   Hyprland config.
 - Hyprland's Lua config does not support `hyprctl keyword`; that's why this
@@ -72,6 +76,8 @@ bin/touchpad-ctl set scroll_factor 0.6
 bin/touchpad-ctl set natural_scroll true
 bin/touchpad-ctl preset macOS
 bin/touchpad-ctl app-set 'com.mitchellh.ghostty' 0.2
+bin/touchpad-ctl app-remove 'com.mitchellh.ghostty'
+bin/touchpad-ctl windows        # window classes currently open
 ```
 
 ## Notes
@@ -90,7 +96,7 @@ bin/touchpad-ctl app-set 'com.mitchellh.ghostty' 0.2
 
 Omarchy shell plugins run unsandboxed inside the shell process. This one only
 runs `touchpad-ctl` (a short, readable Python script), `hyprctl`, and edits the
-files listed above. Window classes entered in the per-app section are validated
+files listed above. Window classes entered in the per-app section are escaped
 before being written to the generated Lua file.
 
 ## License

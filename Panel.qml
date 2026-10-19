@@ -23,6 +23,16 @@ Panel {
   readonly property var s: tp.settings
   readonly property bool ready: s.scroll_factor !== undefined
   property string errorText: ""
+  property var openWindows: []
+
+  // Omarchy's own per-app rules, minus the ones the user already overrides.
+  readonly property var defaultApps: (tp.omarchyApps || []).filter(function(a) {
+    return !tp.apps.some(function(u) { return u["class"] === a["class"] })
+  })
+  // Open windows that don't have a rule yet.
+  readonly property var pickableWindows: openWindows.filter(function(c) {
+    return !tp.apps.some(function(u) { return u["class"] === c })
+  })
 
   // Commands run strictly one at a time; a queued "set" for the same key is
   // replaced so dragging a slider doesn't pile up processes.
@@ -52,9 +62,11 @@ Panel {
     var data
     try { data = JSON.parse(text) } catch (e) { errorText = "Invalid response from touchpad-ctl"; return }
     if (data.error) { errorText = data.error; return }
+    if (data.windows !== undefined) { openWindows = data.windows; return }
     errorText = data.warning || ""
-    // While more commands are pending the UI keeps the optimistic values.
-    if (queue.length === 0) tp = data
+    // While changes are still queued the UI keeps its optimistic values.
+    var pendingChange = queue.some(function(q) { return q.key.indexOf("set:") === 0 || q.key.indexOf("app:") === 0 })
+    if (!pendingChange) tp = data
   }
 
   function setting(key, value) {
@@ -64,7 +76,23 @@ Panel {
     run(["set", key, JSON.stringify(value)], "set:" + key)
   }
 
-  function refresh() { run(["get"], "get") }
+  function refresh() {
+    run(["get"], "get")
+    run(["windows"], "windows")
+  }
+
+  // Optimistic update so the slider doesn't jump back while the command runs.
+  function setApp(cls, value) {
+    var v = Math.round(value * 100) / 100
+    var copy = JSON.parse(JSON.stringify(tp))
+    var found = false
+    for (var i = 0; i < copy.apps.length; i++) {
+      if (copy.apps[i]["class"] === cls) { copy.apps[i].factor = v; found = true }
+    }
+    if (!found) copy.apps.push({ "class": cls, factor: v })
+    tp = copy
+    run(["app-set", cls, String(v)], "app:" + cls)
+  }
 
   function scrollList(wheel) {
     var dy = wheel.pixelDelta.y !== 0 ? wheel.pixelDelta.y : wheel.angleDelta.y / 2
@@ -111,7 +139,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: profileName.activeFocus || appClass.activeFocus || appFactor.activeFocus
+      blocked: profileName.activeFocus || appClass.activeFocus
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
@@ -386,13 +414,13 @@ Panel {
 
           Column {
             width: parent.width
-            spacing: Style.space(8)
+            spacing: Style.space(10)
 
-            PanelSectionHeader { text: "PER-APP SCROLLING"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
+            PanelSectionHeader { text: "PER-APP SCROLL SPEED"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
 
             Text {
               width: parent.width
-              text: "Multiplier applied on top of the global speed. Use the window class (see hyprctl clients)."
+              text: "Replaces the global scroll speed for every window of an app. Your rules win over Omarchy's defaults."
               wrapMode: Text.WordWrap
               color: root.bar.foreground
               opacity: 0.6
@@ -402,36 +430,20 @@ Panel {
 
             Repeater {
               model: root.tp.apps
-              Row {
+              AppSpeed {
                 required property var modelData
-                width: column.width
-                spacing: Style.space(8)
+                appClass: modelData["class"]
+                speed: Number(modelData.factor)
+              }
+            }
 
-                Text {
-                  width: parent.width - factorText.width - removeButton.width - parent.spacing * 2
-                  text: modelData["class"]
-                  elide: Text.ElideRight
-                  color: root.bar.foreground
-                  font.family: root.bar.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  anchors.verticalCenter: parent.verticalCenter
-                }
-                Text {
-                  id: factorText
-                  text: Number(modelData.factor).toFixed(2) + "×"
-                  color: root.bar.foreground
-                  font.family: root.bar.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  anchors.verticalCenter: parent.verticalCenter
-                }
-                PanelActionButton {
-                  id: removeButton
-                  iconText: ""
-                  tooltipText: "Remove"
-                  foreground: root.bar.foreground
-                  fontFamily: root.bar.fontFamily
-                  onClicked: root.run(["app-remove", modelData["class"]])
-                }
+            Repeater {
+              model: root.defaultApps
+              AppSpeed {
+                required property var modelData
+                appClass: modelData["class"]
+                speed: Number(modelData.factor)
+                builtin: true
               }
             }
 
@@ -441,21 +453,11 @@ Panel {
 
               TextField {
                 id: appClass
-                width: parent.width - appFactor.width - addApp.width - parent.spacing * 2
-                placeholderText: "Window class"
+                width: parent.width - addApp.width - parent.spacing
+                placeholderText: "Window class (or pick an open app)"
                 foreground: root.bar.foreground
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.bodySmall
-                onAccepted: appFactor.forceActiveFocus()
-              }
-              TextField {
-                id: appFactor
-                width: Style.space(60)
-                placeholderText: "1.0"
-                foreground: root.bar.foreground
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                inputMethodHints: Qt.ImhFormattedNumbersOnly
                 onAccepted: addApp.add()
               }
               Button {
@@ -467,19 +469,105 @@ Panel {
                 bordered: true
                 function add() {
                   var cls = appClass.text.trim()
-                  var f = parseFloat(appFactor.text.replace(",", "."))
-                  if (cls === "" || isNaN(f)) return
-                  root.run(["app-set", cls, String(f)])
+                  if (cls === "") return
+                  root.setApp(cls, root.s.scroll_factor || 1)
                   appClass.text = ""
-                  appFactor.text = ""
-                  appFactor.focus = false
+                  appClass.focus = false
                 }
                 onClicked: add()
+              }
+            }
+
+            Flow {
+              visible: root.pickableWindows.length > 0
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: root.pickableWindows
+                Button {
+                  required property var modelData
+                  text: String(modelData)
+                  fontSize: Style.font.caption
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  bordered: true
+                  onClicked: appClass.text = String(modelData)
+                }
               }
             }
           }
         }
       }
+    }
+  }
+
+  // PanelSlider changes its value on wheel/two-finger scroll, which hijacks
+  // scrolling the settings list. Put this inside a slider to take the wheel and
+  // scroll the list instead; clicks and drags still reach the slider.
+  component WheelGuard: MouseArea {
+    anchors.fill: parent
+    z: 10
+    acceptedButtons: Qt.NoButton
+    onWheel: function(wheel) { root.scrollList(wheel) }
+  }
+
+  component AppSpeed: Column {
+    id: app
+    property string appClass: ""
+    property real speed: 1
+    property bool builtin: false
+
+    width: parent.width
+    spacing: Style.space(4)
+
+    Row {
+      width: parent.width
+      spacing: Style.space(8)
+
+      Text {
+        width: parent.width - appValue.implicitWidth - appAction.width - parent.spacing * 2
+        text: app.appClass + (app.builtin ? "  · Omarchy default" : "")
+        elide: Text.ElideRight
+        color: root.bar.foreground
+        opacity: app.builtin ? 0.6 : 1
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        anchors.verticalCenter: parent.verticalCenter
+      }
+      Text {
+        id: appValue
+        text: app.speed.toFixed(2) + "×"
+        color: root.bar.foreground
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+        anchors.verticalCenter: parent.verticalCenter
+      }
+      PanelActionButton {
+        id: appAction
+        iconText: app.builtin ? "\uF040" : "\uF00D"
+        tooltipText: app.builtin ? "Override" : "Remove"
+        foreground: root.bar.foreground
+        fontFamily: root.bar.fontFamily
+        onClicked: {
+          if (app.builtin) root.setApp(app.appClass, app.speed)
+          else root.run(["app-remove", app.appClass])
+        }
+      }
+    }
+
+    PanelSlider {
+      visible: !app.builtin
+      bar: root.bar
+      width: parent.width
+      minimum: 0.1
+      maximum: 3
+      step: 0.05
+      value: app.speed
+      onMoved: function(v) { root.setApp(app.appClass, v) }
+
+      WheelGuard {}
     }
   }
 
@@ -528,15 +616,7 @@ Panel {
       width: parent.width
       onMoved: function(v) { row.commit(v) }
 
-      // PanelSlider changes its value on wheel/two-finger scroll, which hijacks
-      // scrolling the settings list. Take the wheel here and scroll the list;
-      // clicks and drags still fall through to the slider underneath.
-      MouseArea {
-        anchors.fill: parent
-        z: 10
-        acceptedButtons: Qt.NoButton
-        onWheel: function(wheel) { root.scrollList(wheel) }
-      }
+      WheelGuard {}
     }
   }
 }
