@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""touchpad-ctl: state, persistence and live-apply for the Touchpad Manager plugin.
+
+State lives in ~/.config/hypr/touchpad.json; the generated Hyprland config in
+~/.config/hypr/touchpad.lua, which input.lua loads with
+`pcall(require, "hypr.touchpad")` (see `setup`). Both files are per-machine.
+
+Commands (all print the full state as JSON on success):
+  get                          print state (first run: seed it from Hyprland)
+  set <key> <json-value>       change one setting (applied live when possible)
+  preset <name>                apply a built-in or saved profile
+  profile-save <name>          save the current settings as a profile
+  profile-delete <name>        delete a saved profile
+  app-set <class> <factor>     per-application scroll factor
+  app-remove <class>           remove a per-application rule
+  apply                        regenerate the Lua file and push it to Hyprland
+  setup                        add the require line to ~/.config/hypr/input.lua
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HYPR_DIR = os.path.expanduser("~/.config/hypr")
+INPUT_FILE = os.path.join(HYPR_DIR, "input.lua")
+STATE_FILE = os.path.join(HYPR_DIR, "touchpad.json")
+LUA_FILE = os.path.join(HYPR_DIR, "touchpad.lua")
+
+REQUIRE_LINE = 'pcall(require, "hypr.touchpad")'
+WIRED_RE = re.compile(
+    r"^\s*(pcall\s*\(\s*require\s*,\s*|require\s*\(?\s*)[\"']hypr\.touchpad[\"']",
+    re.MULTILINE,
+)
+
+# key -> (validator, needs_reload). Gestures and window rules can only be
+# declared from the config file, so they need a reload; the rest is pushed
+# live with `hyprctl eval`.
+SCHEMA = {
+    "natural_scroll": ("bool", False),
+    "scroll_factor": ((0.05, 3.0), False),
+    "sensitivity": ((-1.0, 1.0), False),
+    "accel_profile": (("adaptive", "flat"), False),
+    "tap_to_click": ("bool", False),
+    "disable_while_typing": ("bool", False),
+    "clickfinger_behavior": ("bool", False),
+    "gestures_workspace": ("bool", True),
+    "gestures_fingers": ((3, 4), True),
+    "gestures_natural": ("bool", False),
+}
+
+# Omarchy's stock touchpad configuration, used when Hyprland can't be queried.
+DEFAULTS = {
+    "natural_scroll": False,
+    "scroll_factor": 0.4,
+    "sensitivity": 0.0,
+    "accel_profile": "adaptive",
+    "tap_to_click": True,
+    "disable_while_typing": True,
+    "clickfinger_behavior": True,
+    "gestures_workspace": False,
+    "gestures_fingers": 3,
+    "gestures_natural": True,
+}
+
+BUILTIN_PROFILES = {
+    "macOS": dict(DEFAULTS, natural_scroll=True, scroll_factor=0.5,
+                  sensitivity=0.2, gestures_workspace=True),
+    "Precise": dict(DEFAULTS, natural_scroll=True, scroll_factor=0.3,
+                    sensitivity=-0.2, accel_profile="flat", tap_to_click=False),
+    "Omarchy": dict(DEFAULTS),
+}
+
+# setting -> Hyprland option used to seed the first run from the live config.
+LIVE_OPTIONS = {
+    "natural_scroll": "input:touchpad:natural_scroll",
+    "scroll_factor": "input:touchpad:scroll_factor",
+    "sensitivity": "input:sensitivity",
+    "accel_profile": "input:accel_profile",
+    "tap_to_click": "input:touchpad:tap_to_click",
+    "disable_while_typing": "input:touchpad:disable_while_typing",
+    "clickfinger_behavior": "input:touchpad:clickfinger_behavior",
+    "gestures_natural": "gestures:workspace_swipe_invert",
+}
+
+CLASS_RE = re.compile(r"^[A-Za-z0-9_.\-|()^$*+? ]{1,80}$")
+
+
+def fail(message):
+    print(json.dumps({"error": message}))
+    sys.exit(1)
+
+
+def live_value(option):
+    try:
+        out = subprocess.run(["hyprctl", "getoption", "-j", option],
+                             capture_output=True, text=True, timeout=3).stdout
+        data = json.loads(out)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    for kind in ("bool", "float", "int", "str"):
+        if kind in data:
+            return data[kind]
+    return None
+
+
+def seed_from_hyprland():
+    """Start from what Hyprland is using now so enabling the plugin changes nothing."""
+    settings = dict(DEFAULTS)
+    for key, option in LIVE_OPTIONS.items():
+        value = live_value(option)
+        if value is None:
+            continue
+        rule, _ = SCHEMA[key]
+        if rule == "bool" and isinstance(value, bool):
+            settings[key] = value
+        elif isinstance(rule[0], str) and value in rule:
+            settings[key] = value
+        elif isinstance(rule[0], float) and not isinstance(value, bool):
+            settings[key] = round(min(max(float(value), rule[0]), rule[1]), 2)
+    return settings
+
+
+def load():
+    state = {"settings": dict(DEFAULTS), "profiles": {}, "apps": []}
+    try:
+        with open(STATE_FILE) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        state["settings"] = seed_from_hyprland()
+        return state
+    for key in DEFAULTS:
+        if key in saved.get("settings", {}):
+            state["settings"][key] = saved["settings"][key]
+    state["profiles"] = saved.get("profiles", {})
+    state["apps"] = saved.get("apps", [])
+    return state
+
+
+def write_atomic(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def save(state):
+    write_atomic(STATE_FILE, json.dumps(state, indent=2) + "\n")
+    write_atomic(LUA_FILE, render_lua(state))
+
+
+def lua_bool(value):
+    return "true" if value else "false"
+
+
+def render_lua(state):
+    s = state["settings"]
+    lines = [
+        "-- Generated by the Touchpad Manager plugin. Edits are overwritten.",
+        "hl.config({",
+        "  input = {",
+        f"    sensitivity = {s['sensitivity']:.2f},",
+        f"    accel_profile = \"{s['accel_profile']}\",",
+        "    touchpad = {",
+        f"      natural_scroll = {lua_bool(s['natural_scroll'])},",
+        f"      scroll_factor = {s['scroll_factor']:.2f},",
+        f"      tap_to_click = {lua_bool(s['tap_to_click'])},",
+        f"      disable_while_typing = {lua_bool(s['disable_while_typing'])},",
+        f"      clickfinger_behavior = {lua_bool(s['clickfinger_behavior'])},",
+        "    },",
+        "  },",
+        "  gestures = {",
+        f"    workspace_swipe_invert = {lua_bool(s['gestures_natural'])},",
+        "  },",
+        "})",
+        "",
+    ]
+    if s["gestures_workspace"]:
+        lines.append(
+            f"hl.gesture({{ fingers = {s['gestures_fingers']}, "
+            "direction = \"horizontal\", action = \"workspace\" })"
+        )
+        lines.append("")
+    for app in state["apps"]:
+        lines.append(
+            f"o.window(\"{app['class']}\", "
+            f"{{ scroll_touchpad = {app['factor']:.2f} }})"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def hyprctl(*args):
+    try:
+        result = subprocess.run(["hyprctl", *args], capture_output=True,
+                                text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+    out = (result.stdout + result.stderr).strip()
+    return None if result.returncode == 0 and out in ("", "ok") else out
+
+
+def push_live(settings):
+    t = settings
+    code = (
+        "hl.config({"
+        f"input={{sensitivity={t['sensitivity']:.2f},"
+        f"accel_profile=\"{t['accel_profile']}\","
+        "touchpad={"
+        f"natural_scroll={lua_bool(t['natural_scroll'])},"
+        f"scroll_factor={t['scroll_factor']:.2f},"
+        f"tap_to_click={lua_bool(t['tap_to_click'])},"
+        f"disable_while_typing={lua_bool(t['disable_while_typing'])},"
+        f"clickfinger_behavior={lua_bool(t['clickfinger_behavior'])}"
+        "}},"
+        f"gestures={{workspace_swipe_invert={lua_bool(t['gestures_natural'])}}}"
+        "})"
+    )
+    return hyprctl("eval", code)
+
+
+def is_wired():
+    try:
+        with open(INPUT_FILE) as f:
+            return bool(WIRED_RE.search(f.read()))
+    except OSError:
+        return False
+
+
+def setup():
+    """Append the require line to input.lua (once), keeping a backup."""
+    if is_wired():
+        return None
+    block = (
+        "\n-- Touchpad settings are managed by the Touchpad Manager plugin and\n"
+        "-- generated into hypr/touchpad.lua (per-machine, safe if missing).\n"
+        f"{REQUIRE_LINE}\n"
+    )
+    os.makedirs(HYPR_DIR, exist_ok=True)
+    if os.path.exists(INPUT_FILE):
+        shutil.copy2(INPUT_FILE, f"{INPUT_FILE}.bak.{int(time.time())}")
+        with open(INPUT_FILE) as f:
+            text = f.read()
+    else:
+        text = ""
+    write_atomic(INPUT_FILE, text.rstrip("\n") + "\n" + block)
+    return hyprctl("reload")
+
+
+def validate(key, value):
+    if key not in SCHEMA:
+        fail(f"unknown setting: {key}")
+    rule, _ = SCHEMA[key]
+    if rule == "bool":
+        if not isinstance(value, bool):
+            fail(f"{key} expects true/false")
+    elif isinstance(rule[0], str):
+        if value not in rule:
+            fail(f"{key} must be one of {', '.join(rule)}")
+    elif key == "gestures_fingers":
+        if value not in rule:
+            fail(f"{key} must be 3 or 4")
+    else:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            fail(f"{key} expects a number")
+        lo, hi = rule
+        value = round(min(max(float(value), lo), hi), 2)
+    return value
+
+
+def matching_profile(state):
+    candidates = dict(BUILTIN_PROFILES)
+    candidates.update(state["profiles"])
+    for name, values in candidates.items():
+        if all(state["settings"].get(k) == v for k, v in values.items()):
+            return name
+    return ""
+
+
+def emit(state, warning=None):
+    out = {
+        "settings": state["settings"],
+        "apps": state["apps"],
+        "builtinProfiles": list(BUILTIN_PROFILES),
+        "profiles": sorted(state["profiles"]),
+        "activeProfile": matching_profile(state),
+        "wired": is_wired(),
+    }
+    if warning:
+        out["warning"] = warning
+    print(json.dumps(out))
+
+
+def commit(state, reload_needed):
+    save(state)
+    warning = hyprctl("reload") if reload_needed else push_live(state["settings"])
+    emit(state, warning)
+
+
+def main(argv):
+    if len(argv) < 2:
+        fail("missing command")
+    cmd, args = argv[1], argv[2:]
+    state = load()
+
+    if cmd == "get":
+        # First run on a machine: create the per-machine files. Nothing is
+        # reloaded here, so the plugin never changes behaviour on its own.
+        if not os.path.exists(LUA_FILE):
+            save(state)
+        emit(state)
+    elif cmd == "set" and len(args) == 2:
+        try:
+            value = json.loads(args[1])
+        except ValueError:
+            fail("value must be JSON")
+        value = validate(args[0], value)
+        state["settings"][args[0]] = value
+        commit(state, SCHEMA[args[0]][1])
+    elif cmd == "preset" and len(args) == 1:
+        profile = state["profiles"].get(args[0]) or BUILTIN_PROFILES.get(args[0])
+        if profile is None:
+            fail(f"unknown profile: {args[0]}")
+        reload_needed = any(
+            state["settings"][k] != v and SCHEMA[k][1] for k, v in profile.items()
+        )
+        state["settings"].update(profile)
+        commit(state, reload_needed)
+    elif cmd == "profile-save" and len(args) == 1:
+        name = args[0].strip()
+        if not re.fullmatch(r"[\w .\-]{1,24}", name) or name in BUILTIN_PROFILES:
+            fail("invalid or reserved profile name")
+        state["profiles"][name] = dict(state["settings"])
+        save(state)
+        emit(state)
+    elif cmd == "profile-delete" and len(args) == 1:
+        state["profiles"].pop(args[0], None)
+        save(state)
+        emit(state)
+    elif cmd == "app-set" and len(args) == 2:
+        if not CLASS_RE.match(args[0]):
+            fail("invalid window class")
+        try:
+            factor = round(min(max(float(args[1]), 0.05), 5.0), 2)
+        except ValueError:
+            fail("factor must be a number")
+        state["apps"] = [a for a in state["apps"] if a["class"] != args[0]]
+        state["apps"].append({"class": args[0], "factor": factor})
+        commit(state, True)
+    elif cmd == "app-remove" and len(args) == 1:
+        state["apps"] = [a for a in state["apps"] if a["class"] != args[0]]
+        commit(state, True)
+    elif cmd == "apply":
+        save(state)
+        warning = push_live(state["settings"])
+        emit(state, warning)
+    elif cmd == "setup":
+        save(state)
+        warning = setup()
+        emit(state, warning)
+    else:
+        fail("usage: touchpad-ctl get|set|preset|profile-save|profile-delete|app-set|app-remove|apply|setup")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

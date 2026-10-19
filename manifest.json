@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "fabiocuccaro.touchpad",
+  "name": "Touchpad Manager",
+  "version": "1.0.0",
+  "author": "FabioCuccaro",
+  "license": "MIT",
+  "description": "Touchpad settings for Omarchy: scroll direction and speed, pointer speed and acceleration, tap and click behaviour, workspace gestures, per-app scroll speed and saved profiles.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Touchpad",
+    "description": "Adjust touchpad scrolling, pointer speed, tap-to-click and gestures.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
