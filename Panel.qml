@@ -66,6 +66,12 @@ Panel {
 
   function refresh() { run(["get"], "get") }
 
+  function scrollList(wheel) {
+    var dy = wheel.pixelDelta.y !== 0 ? wheel.pixelDelta.y : wheel.angleDelta.y / 2
+    var maxY = Math.max(0, flick.contentHeight - flick.height)
+    flick.contentY = Math.max(0, Math.min(maxY, flick.contentY - dy))
+  }
+
   function pct(v) { return (v >= 0 ? "+" : "") + Math.round(v * 100) + "%" }
 
   Process {
@@ -521,6 +527,16 @@ Panel {
       bar: root.bar
       width: parent.width
       onMoved: function(v) { row.commit(v) }
+
+      // PanelSlider changes its value on wheel/two-finger scroll, which hijacks
+      // scrolling the settings list. Take the wheel here and scroll the list;
+      // clicks and drags still fall through to the slider underneath.
+      MouseArea {
+        anchors.fill: parent
+        z: 10
+        acceptedButtons: Qt.NoButton
+        onWheel: function(wheel) { root.scrollList(wheel) }
+      }
     }
   }
 }
