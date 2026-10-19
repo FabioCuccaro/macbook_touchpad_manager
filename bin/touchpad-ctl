@@ -11,9 +11,10 @@ Commands (all print the full state as JSON on success):
   preset <name>                apply a built-in or saved profile
   profile-save <name>          save the current settings as a profile
   profile-delete <name>        delete a saved profile
-  app-set <class> <factor>     per-application scroll factor
+  app-set <class> <factor>     scroll speed for one application (replaces the global one)
   app-remove <class>           remove a per-application rule
   apply                        regenerate the Lua file and push it to Hyprland
+  windows                      list the window classes currently open
   setup                        add the require line to ~/.config/hypr/input.lua
 """
 import json
@@ -85,7 +86,46 @@ LIVE_OPTIONS = {
     "gestures_natural": "gestures:workspace_swipe_invert",
 }
 
-CLASS_RE = re.compile(r"^[A-Za-z0-9_.\-|()^$*+? ]{1,80}$")
+OMARCHY_INPUT = os.path.join(
+    os.environ.get("OMARCHY_PATH") or "/usr/share/omarchy",
+    "default", "hypr", "input.lua",
+)
+OMARCHY_APP_RE = re.compile(
+    r'^\s*o\.window\(\s*"((?:[^"\\]|\\.)*)"\s*,\s*\{\s*scroll_touchpad\s*=\s*([0-9.]+)\s*\}\s*\)',
+    re.MULTILINE,
+)
+
+
+def valid_class(value):
+    return 1 <= len(value) <= 120 and all(ord(c) >= 32 for c in value)
+
+
+def lua_str(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def omarchy_apps():
+    """Per-app scroll rules Omarchy ships; ours are loaded later and win."""
+    try:
+        with open(OMARCHY_INPUT) as f:
+            text = f.read()
+    except OSError:
+        return []
+    return [
+        {"class": m.group(1).replace('\\"', '"').replace("\\\\", "\\"),
+         "factor": float(m.group(2))}
+        for m in OMARCHY_APP_RE.finditer(text)
+    ]
+
+
+def open_windows():
+    try:
+        out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True,
+                             text=True, timeout=3).stdout
+        clients = json.loads(out)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    return sorted({c.get("class", "") for c in clients if valid_class(c.get("class", ""))})
 
 
 def fail(message):
@@ -186,7 +226,7 @@ def render_lua(state):
         lines.append("")
     for app in state["apps"]:
         lines.append(
-            f"o.window(\"{app['class']}\", "
+            f"o.window({lua_str(app['class'])}, "
             f"{{ scroll_touchpad = {app['factor']:.2f} }})"
         )
     return "\n".join(lines) + "\n"
@@ -219,6 +259,15 @@ def push_live(settings):
         "})"
     )
     return hyprctl("eval", code)
+
+
+def push_app_live(app_class, factor):
+    # Live rules stack until the next reload; the latest one wins, which is
+    # also how a rule here overrides Omarchy's defaults.
+    return hyprctl(
+        "eval",
+        f"hl.window_rule({{match={{class={lua_str(app_class)}}}, scroll_touchpad={factor:.2f}}})",
+    )
 
 
 def is_wired():
@@ -283,6 +332,7 @@ def emit(state, warning=None):
     out = {
         "settings": state["settings"],
         "apps": state["apps"],
+        "omarchyApps": omarchy_apps(),
         "builtinProfiles": list(BUILTIN_PROFILES),
         "profiles": sorted(state["profiles"]),
         "activeProfile": matching_profile(state),
@@ -340,7 +390,7 @@ def main(argv):
         save(state)
         emit(state)
     elif cmd == "app-set" and len(args) == 2:
-        if not CLASS_RE.match(args[0]):
+        if not valid_class(args[0]):
             fail("invalid window class")
         try:
             factor = round(min(max(float(args[1]), 0.05), 5.0), 2)
@@ -348,7 +398,8 @@ def main(argv):
             fail("factor must be a number")
         state["apps"] = [a for a in state["apps"] if a["class"] != args[0]]
         state["apps"].append({"class": args[0], "factor": factor})
-        commit(state, True)
+        save(state)
+        emit(state, push_app_live(args[0], factor))
     elif cmd == "app-remove" and len(args) == 1:
         state["apps"] = [a for a in state["apps"] if a["class"] != args[0]]
         commit(state, True)
@@ -356,12 +407,14 @@ def main(argv):
         save(state)
         warning = push_live(state["settings"])
         emit(state, warning)
+    elif cmd == "windows":
+        print(json.dumps({"windows": open_windows()}))
     elif cmd == "setup":
         save(state)
         warning = setup()
         emit(state, warning)
     else:
-        fail("usage: touchpad-ctl get|set|preset|profile-save|profile-delete|app-set|app-remove|apply|setup")
+        fail("usage: touchpad-ctl get|set|preset|profile-save|profile-delete|app-set|app-remove|apply|windows|setup")
 
 
 if __name__ == "__main__":
